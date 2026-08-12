@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import threading
 import time
+from datetime import datetime
 from collections.abc import Callable, Coroutine, Iterator
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import contextmanager
@@ -538,8 +541,17 @@ class StreamCardController(StreamingController):
 
     def _completion_session(self, message_id: str) -> CardSession | None:
         session = self._sessions.get(message_id)
-        if session is not None and (not session.state.is_terminal or session.state == SessionState.FAILED):
-            return session
+        if session is not None:
+            # 终态 session 如果卡片已发送成功，仍需返回给 on_completed_wait，
+            # 否则 gateway 会误判为"卡片没发"触发纯文本兜底。
+            if not session.state.is_terminal or session.state == SessionState.FAILED:
+                return session
+            if session.has_card:
+                _logger.info(
+                    "on_completed: session terminal but has_card, returning: msg=%s state=%s",
+                    message_id[:12], session.state,
+                )
+                return session
 
         redirected_id = self._interrupt_map.pop(message_id, None)
         if redirected_id is not None:
@@ -549,8 +561,15 @@ class StreamCardController(StreamingController):
                 redirected_id[:12],
             )
             redirected = self._sessions.get(redirected_id)
-            if redirected is not None and not redirected.state.is_terminal:
-                return redirected
+            if redirected is not None:
+                if not redirected.state.is_terminal:
+                    return redirected
+                if redirected.has_card:
+                    _logger.info(
+                        "on_completed: redirect terminal but has_card: msg=%s -> msg=%s state=%s",
+                        message_id[:12], redirected_id[:12], redirected.state,
+                    )
+                    return redirected
         return None
 
     async def _wait_for_card_creation(self, session: CardSession) -> bool:
@@ -589,21 +608,83 @@ class StreamCardController(StreamingController):
         tokens: dict | None,
         context: dict | None,
     ) -> None:
-        if answer and session.segment_state and not any(
-            seg.type == SegmentType.ANSWER for seg in session.segment_state.segments
-        ):
+        if answer and session.segment_state:
             final_answer = strip_reasoning_tags(answer)
             if final_answer:
-                session.segment_state.on_answer_delta(final_answer)
+                existing_answer_text = "".join(
+                    seg.text
+                    for seg in session.segment_state.segments
+                    if seg.type == SegmentType.ANSWER
+                )
+                # Hermes 0.19+ 会把工具间隙的过渡评论（"让我看看…"）也路由到
+                # stream_delta_callback，被误建成短 answer 段。此时不能因
+                # "已有 ANSWER 段"就跳过最终答案——否则真实回复会丢失，
+                # 卡片停在中间状态，用户看到"已完成但没答完"。
+                # 只有当最终答案已完整包含在流式内容中时才跳过。
+                if final_answer not in existing_answer_text:
+                    session.segment_state.on_answer_delta(final_answer)
 
         session.footer = {
             "duration": duration,
             "model": model,
+            "skills": self._collect_skills(session),
+            "quota": self._read_quota(),
             **({"input_tokens": tokens.get("input_tokens")} if tokens else {}),
             **({"output_tokens": tokens.get("output_tokens")} if tokens else {}),
             **({"context_used": context.get("used_tokens")} if context else {}),
             **({"context_max": context.get("max_tokens")} if context else {}),
         }
+
+    def _collect_skills(self, session: CardSession) -> list[str]:
+        """从工具调用记录提取本轮加载/修改的 skill 名.
+
+        skill_view/skill_manage 的 detail（preview）就是 skill 名（display.py 的
+        build_tool_preview 对 skill_view/skill_manage 取 args['name']）。无则返回空。
+        """
+        try:
+            steps = session.tool_use.build_display_steps()
+            names: list[str] = []
+            for s in steps:
+                name = (s.get("name") or "").lower()
+                if name not in ("skill_view", "skill_manage", "skills_list"):
+                    continue
+                detail = (s.get("detail") or "").strip()
+                if detail and detail not in names:
+                    names.append(detail)
+            return names
+        except Exception:
+            return []
+
+    def _read_quota(self) -> str | None:
+        """读 cache/quota.json（fetch_quota.py 定时写入），返回显示串。
+
+        格式：'T 751/1000 · FC 873/1000'；无缓存/损坏返回 None（footer 隐藏）。
+        纯本地读、零阻塞，遵守社区红线（完成路径不做网络请求）。
+        """
+        try:
+            q_path = Path(self._profile_home) / "cache" / "quota.json"
+            if not q_path.exists():
+                return None
+            data = json.loads(q_path.read_text(encoding="utf-8"))
+            parts: list[str] = []
+            tv = data.get("tavily") or {}
+            if tv.get("limit"):
+                used = tv.get("used", 0) or 0
+                parts.append(f"T {tv['limit'] - used}/{tv['limit']}")
+            fc = data.get("firecrawl") or {}
+            if fc.get("plan"):
+                parts.append(f"FC {fc.get('remaining', 0) or 0}/{fc['plan']}")
+            ex = data.get("exa") or {}
+            bal = ex.get("balance_usd")
+            if isinstance(bal, (int, float)):
+                parts.append(f"EX ${bal:.2f}")
+            og = data.get("opencode") or {}
+            pct = og.get("monthly_pct")
+            if isinstance(pct, (int, float)):
+                parts.append(f"OG 月{int(pct)}%")
+            return " · ".join(parts) if parts else None
+        except Exception:
+            return None
 
     def _complete_session(self, session: CardSession) -> None:
         """异步完成当前流式卡片."""

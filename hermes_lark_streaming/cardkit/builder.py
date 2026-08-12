@@ -110,7 +110,7 @@ def _build_tool_panel(
     steps: list[ToolDisplayStep],
     elapsed_ms: float = 0,
     *,
-    expanded: bool = True,
+    expanded: bool = False,
     element_id: str | None = TOOL_PANEL_ELEMENT_ID,
 ) -> dict:
     en_t, zh_t = _T["tool_use"]
@@ -350,6 +350,9 @@ def _render_footer_field(
 
     if name == "model":
         v = data.get("model") or None
+        q = data.get("quota")
+        if v and q:
+            v = f"{v} · {q}"
         return v, v
 
     if name == "tokens":
@@ -369,6 +372,13 @@ def _render_footer_field(
             if show_label:
                 return _T["context"][0].format(val), _T["context"][1].format(val)
             return val, val
+        return None, None
+
+    if name == "skills":
+        v = data.get("skills")
+        if isinstance(v, (list, tuple)) and v:
+            text = "📚 " + " · ".join(str(x) for x in v)
+            return text, text
         return None, None
 
     return None, None
@@ -418,7 +428,7 @@ def build_streaming_card_v2(
 
     if show_reasoning:
         elements.append(
-            _build_reasoning_panel(" ", expanded=True, element_id=REASONING_ELEMENT_ID)
+            _build_reasoning_panel(" ", expanded=False, element_id=REASONING_ELEMENT_ID)
         )
 
     if show_tool_use:
