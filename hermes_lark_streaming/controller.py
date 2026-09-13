@@ -109,13 +109,20 @@ class StreamCardController(StreamingController):
             self._initialized = True
 
     def _get_loop(self) -> asyncio.AbstractEventLoop | None:
-        """获取事件循环，缓存以便跨线程复用."""
+        """获取事件循环，缓存以便跨线程复用.
+
+        只把「循环所在线程」里取到的 running loop 记为权威。工作线程里
+        ``get_running_loop()`` 会抛 RuntimeError，此时绝不能把该线程误当成
+        循环线程——否则后续 ``loop.create_task`` 会从错误线程驱动事件循环
+        （非线程安全，可致 loop 崩溃）。跨线程场景只读缓存。
+        """
         try:
             loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
             self._loop = loop
             return loop
-        except RuntimeError:
-            pass
         if self._loop is not None and not self._loop.is_closed():
             return self._loop
         return None
@@ -132,18 +139,36 @@ class StreamCardController(StreamingController):
         coro: Coroutine[Any, Any, Any],
         loop: asyncio.AbstractEventLoop,
     ) -> asyncio.Future[Any] | ConcurrentFuture | None:
+        """调度后台协程。
+
+        ``loop.create_task`` 只在循环所在线程安全；从工作线程调用会以非
+        线程安全的方式唤醒事件循环（会改写 ``loop._ready``，与循环线程的
+        ``_run_once`` 竞争，可致 ``RuntimeError: list changed size during
+        iteration`` 并让 loop 崩掉）。因此先判断线程身份，非循环线程一律
+        走 ``run_coroutine_threadsafe``。
+        """
+        is_loop_thread = False
         try:
-            task = loop.create_task(coro)
-            task.add_done_callback(self._on_bg_task_done)
-            return task
+            is_loop_thread = asyncio.get_running_loop() is loop
         except RuntimeError:
+            is_loop_thread = False
+
+        if is_loop_thread:
             try:
-                fut = asyncio.run_coroutine_threadsafe(coro, loop)
-                fut.add_done_callback(self._on_bg_task_done)
-                return fut
-            except Exception:
-                _logger.debug("fire_and_forget failed", exc_info=True)
-                return None
+                task = loop.create_task(coro)
+                task.add_done_callback(self._on_bg_task_done)
+                return task
+            except RuntimeError:
+                pass
+        try:
+            fut = asyncio.run_coroutine_threadsafe(coro, loop)
+            fut.add_done_callback(self._on_bg_task_done)
+            return fut
+        except Exception:
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            _logger.debug("fire_and_forget failed", exc_info=True)
+            return None
 
     def on_message_started(
         self,

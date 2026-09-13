@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from collections.abc import Awaitable, Callable
 
@@ -26,11 +27,17 @@ class FlushController:
         self._flush_in_progress = False
         self._needs_reflush = False
         self._pending_timer: asyncio.TimerHandle | None = None
+        self._timer_pending = False
         self._last_update_time = 0.0
         self._completed = False
         self._card_message_ready = False
         self._flush_resolvers: list[asyncio.Future[None]] = []
         self._loop = loop if loop is not None else asyncio.get_running_loop()
+        # 串行化跨线程调度：timer 句柄与节流状态只在这个锁内读写，
+        # 避免与控制权所在线程的 _run_once 竞争 _scheduled 堆（见 _schedule）。
+        # 用 RLock：schedule_update 持锁时会同步调用 _do_flush_task（立即 flush
+        # 分支），后者同样需要清理 timer 状态——普通 Lock 会在同线程自锁。
+        self._schedule_lock = threading.RLock()
 
     @property
     def throttle_ms(self) -> float:
@@ -49,31 +56,33 @@ class FlushController:
 
         do_flush: async callable，执行实际 API 调用.
         """
-        if self._completed or not self._card_message_ready:
-            return
-        now = time.monotonic()
-        elapsed = now - self._last_update_time
+        with self._schedule_lock:
+            if self._completed or not self._card_message_ready:
+                return
+            now = time.monotonic()
+            elapsed = now - self._last_update_time
 
-        if elapsed >= self._throttle_ms:
-            # 超出节流窗口
-            if elapsed > LONG_GAP_MS:
-                # 长时间空闲 → 延迟一小批让内容更完整
-                if self._pending_timer is None:
-                    self._schedule(delay=BATCH_AFTER_GAP_MS, do_flush=do_flush)
+            if elapsed >= self._throttle_ms:
+                # 超出节流窗口
+                if elapsed > LONG_GAP_MS:
+                    # 长时间空闲 → 延迟一小批让内容更完整
+                    if not self._timer_pending:
+                        self._schedule(delay=BATCH_AFTER_GAP_MS, do_flush=do_flush)
+                else:
+                    # 立即 flush
+                    self._do_flush_task(do_flush)
             else:
-                # 立即 flush
-                self._do_flush_task(do_flush)
-        else:
-            # 仍在节流窗口内 → 延迟到窗口边界
-            if self._pending_timer is None:
-                delay = self._throttle_ms - elapsed
-                self._schedule(delay=delay, do_flush=do_flush)
+                # 仍在节流窗口内 → 延迟到窗口边界
+                if not self._timer_pending:
+                    delay = self._throttle_ms - elapsed
+                    self._schedule(delay=delay, do_flush=do_flush)
 
     async def flush_now(self, do_flush: Callable[[], Awaitable[None]]) -> None:
         """立即执行一次 flush，等待完成."""
-        if self._completed or not self._card_message_ready:
-            return
-        self._cancel_timer()
+        with self._schedule_lock:
+            if self._completed or not self._card_message_ready:
+                return
+            self._cancel_timer()
         await self._do_flush(do_flush)
 
     async def wait_for_flush(self) -> None:
@@ -86,8 +95,9 @@ class FlushController:
 
     def mark_completed(self) -> None:
         """标记完成，不再接受新更新."""
-        self._completed = True
-        self._cancel_timer()
+        with self._schedule_lock:
+            self._completed = True
+            self._cancel_timer()
         for r in self._flush_resolvers:
             if not r.done():
                 r.set_result(None)
@@ -98,21 +108,66 @@ class FlushController:
 
     def set_card_message_ready(self, ready: bool) -> None:
         """设置卡片消息已就绪，初始化时间戳."""
-        self._card_message_ready = ready
-        if ready:
-            self._last_update_time = time.monotonic()
+        with self._schedule_lock:
+            self._card_message_ready = ready
+            if ready:
+                self._last_update_time = time.monotonic()
+
+    def _is_loop_thread(self) -> bool:
+        """判断当前线程是否为事件循环所在线程."""
+        try:
+            return asyncio.get_running_loop() is self._loop
+        except RuntimeError:
+            return False
 
     def _schedule(self, delay: float, do_flush: Callable[[], Awaitable[None]]) -> None:
+        """安排一次延迟 flush（调用方持有 _schedule_lock）.
+
+        ``loop.call_later`` 会 heappush ``loop._scheduled``，而该堆只在循环
+        所在线程安全。流式回调可能在 agent 工作线程（gateway 的
+        hermes-gateway_* 线程）里执行，直接在那些线程 heappush 会与循环
+        线程的 heappop 竞争，抛出
+        ``RuntimeError: list changed size during iteration`` 并**让整个
+        事件循环崩掉**。所以非循环线程一律用 call_soon_threadsafe 把
+        "装载定时器"这一步交回循环线程执行。
+        """
         self._cancel_timer()
-        self._pending_timer = self._loop.call_later(
-            delay,
-            self._do_flush_task,
-            do_flush,
-        )
+        self._timer_pending = True
+        if self._is_loop_thread():
+            self._arm_timer(delay, do_flush)
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._arm_timer, delay, do_flush)
+        except RuntimeError:  # 循环已关闭
+            self._timer_pending = False
+
+    def _arm_timer(self, delay: float, do_flush: Callable[[], Awaitable[None]]) -> None:
+        """在事件循环线程内装载定时器（唯一允许 heappush 的地方）."""
+        try:
+            self._pending_timer = self._loop.call_later(
+                delay,
+                self._do_flush_task,
+                do_flush,
+            )
+        except RuntimeError:  # 循环已关闭
+            self._timer_pending = False
+
+    def _start_flush(self, do_flush: Callable[[], Awaitable[None]]) -> None:
+        """把 flush 协程交给事件循环线程，调用方线程不限."""
+        coro = self._do_flush(do_flush)
+        if self._is_loop_thread():
+            self._loop.create_task(coro)
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(coro, self._loop)
+        except RuntimeError:
+            coro.close()
 
     def _do_flush_task(self, do_flush: Callable[[], Awaitable[None]]) -> None:
-        self._pending_timer = None
-        self._loop.call_soon(asyncio.create_task, self._do_flush(do_flush))
+        with self._schedule_lock:
+            self._pending_timer = None
+            self._timer_pending = False
+        self._start_flush(do_flush)
 
     async def _do_flush(self, do_flush: Callable[[], Awaitable[None]]) -> None:
         if self._completed or self._flush_in_progress:
@@ -138,9 +193,10 @@ class FlushController:
         # 如果 flush 期间又有新数据 → 立即重刷
         if self._needs_reflush and not self._completed:
             self._needs_reflush = False
-            self._loop.call_soon(asyncio.create_task, self._do_flush(do_flush))
+            self._start_flush(do_flush)
 
     def _cancel_timer(self) -> None:
         if self._pending_timer is not None:
             self._pending_timer.cancel()
             self._pending_timer = None
+        self._timer_pending = False
